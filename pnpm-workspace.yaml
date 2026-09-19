@@ -1,0 +1,18 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Allow Prisma/NestJS postinstall scripts to run (client generation, native
+# binary setup) without an interactive `pnpm approve-builds` prompt.
+onlyBuiltDependencies:
+  - "@nestjs/core"
+  - "@prisma/client"
+  - "@prisma/engines"
+  - "prisma"
+
+# Merged in from apps/web's own create-next-app-generated pnpm-workspace.yaml
+# (deleted — a monorepo has exactly one, at the root).
+ignoredBuiltDependencies:
+  - "sharp"
+  - "unrs-resolver"
+

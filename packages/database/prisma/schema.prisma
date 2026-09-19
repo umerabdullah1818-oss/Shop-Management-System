@@ -1,0 +1,727 @@
+// Phase 4 deliverable — schema design only. No application code (services,
+// controllers, business logic) exists yet; that is Phase 8, after Phases 5-7
+// are reviewed. See docs/08-database-schema.md for the rationale behind every
+// non-obvious choice here (ID strategy, FIFO tables, audit/sync structure).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN
+  CASHIER
+}
+
+enum EntityStatus {
+  ACTIVE
+  DISABLED
+}
+
+enum PurchasePaymentStatus {
+  PAID
+  PARTIAL
+  UNPAID
+}
+
+enum BatchStatus {
+  ACTIVE // remainingQty > 0
+  EXHAUSTED // remainingQty == 0
+}
+
+enum MovementType {
+  PURCHASE
+  SALE
+  RETURN
+  ADJUSTMENT
+  DAMAGED
+  EXPIRED
+  OTHER
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  BANK
+  KHATA
+}
+
+enum SaleStatus {
+  COMPLETED
+  CANCELLED
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum KhataTransactionType {
+  CREDIT_SALE
+  PAYMENT_RECEIVED
+  RETURN_ADJUSTMENT
+  CANCELLATION
+  APPROVED_ADJUSTMENT
+}
+
+enum SyncState {
+  LOCAL_ONLY
+  PENDING_SYNC
+  SYNCING
+  SYNCED
+  SYNC_FAILED
+  CONFLICT
+}
+
+enum ExpenseCategory {
+  RENT
+  ELECTRICITY
+  TRANSPORT
+  SALARIES
+  MAINTENANCE
+  OTHER
+}
+
+enum DeviceType {
+  LOCAL_SERVER
+  POS_TERMINAL
+}
+
+enum ReturnStatus {
+  COMPLETED
+  CANCELLED
+}
+
+enum SyncConflictStatus {
+  OPEN
+  RESOLVED
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Identity & access
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id // ULID, app-generated (see docs/08-database-schema.md §2)
+  name         String
+  username     String?  @unique // Admin login
+  passwordHash String? // Admin only
+  pinHash      String? // Cashier quick-login (SEC-002)
+  role         UserRole
+  status       EntityStatus @default(ACTIVE)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  shifts                  Shift[]
+  salesAsCashier          Sale[]                 @relation("SaleCashier")
+  salesCancelled          Sale[]                 @relation("SaleCancelledBy")
+  inventoryMovements      InventoryMovement[]
+  auditLogs               AuditLog[]
+  expenses                Expense[]              @relation("ExpenseAddedBy")
+  purchasesCreated        Purchase[]              @relation("PurchaseCreatedBy")
+  returnsProcessed        Return[]                @relation("ReturnProcessedBy")
+  supplierPayments        SupplierPayment[]
+  khataPaymentsReceived   KhataPayment[]
+  overrideAuthorizations  OverrideAuthorization[] @relation("OverrideAdmin")
+
+  @@index([role, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Catalog
+// ─────────────────────────────────────────────────────────────────────────
+
+model Category {
+  id        String       @id @default(cuid())
+  name      String
+  status    EntityStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  products Product[]
+}
+
+model Product {
+  id             String       @id // ULID
+  name           String
+  sku            String       @unique
+  barcode        String?      @unique
+  categoryId     String
+  unit           String // "Piece" | "Box" | "Set" | ... — descriptive only (Decision #9)
+  officialPrice  Decimal      @db.Decimal(12, 2)
+  minStockLevel  Decimal      @db.Decimal(12, 2) @default(0)
+  status         EntityStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  category         Category             @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  purchaseItems     PurchaseItem[]
+  inventoryBatches  InventoryBatch[]
+  inventoryMovements InventoryMovement[]
+  saleItems         SaleItem[]
+
+  @@index([categoryId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Suppliers & purchases
+// ─────────────────────────────────────────────────────────────────────────
+
+model Supplier {
+  id        String       @id // ULID
+  name      String
+  phone     String?
+  email     String?
+  address   String?
+  status    EntityStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  purchases         Purchase[]
+  supplierPayments  SupplierPayment[]
+  inventoryBatches  InventoryBatch[] // denormalized for query convenience
+
+  @@index([status])
+}
+
+model Purchase {
+  id                    String                @id // ULID
+  supplierId            String
+  supplierInvoiceNumber String?
+  purchaseDate          DateTime
+  paymentStatus         PurchasePaymentStatus @default(UNPAID)
+  amountPaid            Decimal               @db.Decimal(12, 2) @default(0)
+  amountPayable         Decimal               @db.Decimal(12, 2) @default(0)
+  createdById           String
+  createdAt             DateTime              @default(now())
+
+  supplier  Supplier       @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  createdBy User           @relation("PurchaseCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  items     PurchaseItem[]
+  supplierPayments SupplierPayment[]
+
+  @@index([supplierId])
+  @@index([purchaseDate])
+}
+
+// One line item = one product = exactly one InventoryBatch (§13 — never merged).
+model PurchaseItem {
+  id          String   @id // ULID
+  purchaseId  String
+  productId   String
+  quantity    Decimal  @db.Decimal(12, 2)
+  costPerUnit Decimal  @db.Decimal(12, 2)
+  totalCost   Decimal  @db.Decimal(12, 2)
+  createdAt   DateTime @default(now())
+
+  purchase Purchase        @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+  product  Product         @relation(fields: [productId], references: [id], onDelete: Restrict)
+  batch    InventoryBatch?
+
+  @@index([purchaseId])
+  @@index([productId])
+}
+
+model SupplierPayment {
+  id           String        @id // ULID
+  supplierId   String
+  purchaseId   String? // optional link to a specific purchase (Decision #8: allocation is oldest-first regardless)
+  amount       Decimal       @db.Decimal(12, 2)
+  method       PaymentMethod
+  paymentDate  DateTime
+  userId       String
+  notes        String?
+  createdAt    DateTime      @default(now())
+
+  supplier Supplier  @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  purchase Purchase? @relation(fields: [purchaseId], references: [id], onDelete: Restrict)
+  user     User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([supplierId])
+  @@index([purchaseId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Inventory / FIFO — see docs/08-database-schema.md §3
+// ─────────────────────────────────────────────────────────────────────────
+
+model InventoryBatch {
+  id             String      @id // ULID
+  productId      String
+  purchaseItemId String      @unique // 1:1 with PurchaseItem
+  supplierId     String // denormalized for query convenience
+  purchaseDate   DateTime
+  originalQty    Decimal     @db.Decimal(12, 2)
+  remainingQty   Decimal     @db.Decimal(12, 2)
+  unitCost       Decimal     @db.Decimal(12, 2) // write-once after creation
+  status         BatchStatus @default(ACTIVE)
+  createdAt      DateTime    @default(now()) // defines FIFO order (BR-004)
+
+  product      Product              @relation(fields: [productId], references: [id], onDelete: Restrict)
+  purchaseItem PurchaseItem         @relation(fields: [purchaseItemId], references: [id], onDelete: Restrict)
+  supplier     Supplier             @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  movements    InventoryMovement[]
+  allocations  SaleItemBatchAllocation[]
+  restocks     ReturnItemBatchRestock[]
+
+  @@index([productId, remainingQty])
+  @@index([productId, createdAt])
+}
+
+// Append-only ledger — current stock is always derivable from this table (§4).
+model InventoryMovement {
+  id         String       @id // ULID
+  batchId    String
+  productId  String
+  type       MovementType
+  quantity   Decimal      @db.Decimal(12, 2) // signed: + for purchase/return, - for sale/damage
+  referenceType String? // e.g. "Sale", "Return", "Purchase", "ManualAdjustment"
+  referenceId   String?
+  userId     String
+  reason     String?
+  occurredAt DateTime     @default(now())
+  createdAt  DateTime     @default(now())
+
+  batch   InventoryBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  product Product        @relation(fields: [productId], references: [id], onDelete: Restrict)
+  user    User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([batchId])
+  @@index([productId, occurredAt])
+  @@index([referenceType, referenceId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Customers & Khata
+// ─────────────────────────────────────────────────────────────────────────
+
+model Customer {
+  id        String       @id // ULID
+  name      String
+  phone     String?
+  email     String?
+  address   String?
+  isWalkIn  Boolean      @default(false) // seeded row; walk-in sales must be fully paid (BR-007)
+  status    EntityStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  khataAccount  KhataAccount?
+  sales         Sale[]
+  khataPayments KhataPayment[]
+
+  @@index([phone])
+  @@index([status])
+}
+
+model KhataAccount {
+  id         String   @id // ULID
+  customerId String   @unique
+  createdAt  DateTime @default(now())
+
+  customer     Customer            @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  transactions KhataTransaction[]
+}
+
+// Append-only ledger (§4) — balance is always derived from this table, never
+// edited directly.
+model KhataTransaction {
+  id             String               @id // ULID
+  khataAccountId String
+  type           KhataTransactionType
+  amount         Decimal              @db.Decimal(12, 2) // signed: + increases owed, - decreases owed
+  saleId         String?
+  returnId       String?
+  note           String?
+  occurredAt     DateTime             @default(now())
+  createdAt      DateTime             @default(now())
+
+  khataAccount KhataAccount @relation(fields: [khataAccountId], references: [id], onDelete: Restrict)
+  sale         Sale?        @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  return       Return?      @relation(fields: [returnId], references: [id], onDelete: Restrict)
+
+  @@index([khataAccountId, occurredAt])
+}
+
+// A single lump payment from a customer, allocated oldest-invoice-first
+// (BR-008) across possibly several Sales via KhataPaymentAllocation.
+model KhataPayment {
+  id         String        @id // ULID
+  customerId String
+  amount     Decimal       @db.Decimal(12, 2)
+  method     PaymentMethod
+  userId     String
+  shiftId    String? // nullable: Admin can record a Khata collection outside any shift (e.g. back office)
+  receivedAt DateTime      @default(now())
+  createdAt  DateTime      @default(now())
+
+  customer    Customer                @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  user        User                    @relation(fields: [userId], references: [id], onDelete: Restrict)
+  shift       Shift?                  @relation(fields: [shiftId], references: [id], onDelete: Restrict)
+  allocations KhataPaymentAllocation[]
+
+  @@index([customerId])
+  @@index([shiftId])
+}
+
+model KhataPaymentAllocation {
+  id             String   @id // ULID
+  khataPaymentId String
+  saleId         String
+  amountAllocated Decimal @db.Decimal(12, 2)
+  createdAt      DateTime @default(now())
+
+  khataPayment KhataPayment @relation(fields: [khataPaymentId], references: [id], onDelete: Restrict)
+  sale         Sale         @relation(fields: [saleId], references: [id], onDelete: Restrict)
+
+  @@index([khataPaymentId])
+  @@index([saleId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Shifts & counters
+// ─────────────────────────────────────────────────────────────────────────
+
+model Counter {
+  id        String   @id @default(cuid())
+  name      String   @unique // e.g. "C1", "C2" — used in invoice numbering (Decision #5)
+  createdAt DateTime @default(now())
+
+  shifts Shift[]
+  sales  Sale[]
+}
+
+// Backs the offline-safe invoice numbering scheme (Decision #5):
+// SHOP-C{counter}-{year}-{sequence}. A per-(counter, year) counter,
+// incremented via a locking UPDATE inside the sale's own transaction — safe
+// under the confirmed single-local-writer architecture (Decision #16), and
+// still correct even if that assumption ever changed, since the UPDATE
+// takes a row lock for the duration of the transaction.
+model InvoiceSequence {
+  counterId String
+  year      Int
+  nextValue Int    @default(1)
+
+  @@id([counterId, year])
+}
+
+model Shift {
+  id           String      @id // ULID
+  counterId    String
+  userId       String
+  openingCash  Decimal     @db.Decimal(12, 2)
+  closingCash  Decimal?    @db.Decimal(12, 2)
+  expectedCash Decimal?    @db.Decimal(12, 2)
+  difference   Decimal?    @db.Decimal(12, 2)
+  status       ShiftStatus @default(OPEN)
+  openedAt     DateTime    @default(now())
+  closedAt     DateTime?
+
+  counter       Counter        @relation(fields: [counterId], references: [id], onDelete: Restrict)
+  user          User           @relation(fields: [userId], references: [id], onDelete: Restrict)
+  sales         Sale[]
+  khataPayments KhataPayment[]
+  returns       Return[]
+  expenses      Expense[]
+
+  // NOTE (BR-021): "one OPEN shift per counter" is enforced by a Postgres
+  // PARTIAL unique index added via manual migration, not expressible as a
+  // plain Prisma @@unique — see docs/08-database-schema.md §5:
+  //   CREATE UNIQUE INDEX one_open_shift_per_counter
+  //     ON "Shift" ("counterId") WHERE status = 'OPEN';
+  @@index([counterId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Sales
+// ─────────────────────────────────────────────────────────────────────────
+
+model Sale {
+  id               String        @id // ULID
+  invoiceNumber    String        @unique // SHOP-C{counter}-{year}-{seq}, Decision #5
+  counterId        String
+  shiftId          String
+  cashierId        String
+  customerId       String
+  subtotal         Decimal       @db.Decimal(12, 2)
+  discountTotal    Decimal       @db.Decimal(12, 2) @default(0)
+  grandTotal       Decimal       @db.Decimal(12, 2)
+  amountPaid       Decimal       @db.Decimal(12, 2)
+  remainingAmount  Decimal       @db.Decimal(12, 2) @default(0)
+  paymentMethod    PaymentMethod
+  status           SaleStatus    @default(COMPLETED)
+  occurredAt       DateTime      @default(now())
+  createdAt        DateTime      @default(now())
+  cancelledAt      DateTime?
+  cancelledById    String?
+  cancelReason     String?
+
+  counter               Counter                  @relation(fields: [counterId], references: [id], onDelete: Restrict)
+  shift                 Shift                    @relation(fields: [shiftId], references: [id], onDelete: Restrict)
+  cashier               User                     @relation("SaleCashier", fields: [cashierId], references: [id], onDelete: Restrict)
+  cancelledBy           User?                    @relation("SaleCancelledBy", fields: [cancelledById], references: [id], onDelete: Restrict)
+  customer              Customer                 @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  items                 SaleItem[]
+  payments              Payment[]
+  khataPaymentAllocations KhataPaymentAllocation[]
+  khataTransactions      KhataTransaction[]
+  returns                Return[]
+  overrideAuthorizations OverrideAuthorization[]
+
+  @@index([occurredAt])
+  @@index([customerId, status])
+  @@index([shiftId])
+}
+
+model SaleItem {
+  id                 String   @id // ULID
+  saleId             String
+  productId          String
+  quantity           Decimal  @db.Decimal(12, 2)
+  unitPrice          Decimal  @db.Decimal(12, 2) // actual selling price charged (BR-016)
+  officialPriceAtSale Decimal @db.Decimal(12, 2) // snapshot — never re-derived later (BR-015)
+  discountAmount     Decimal  @db.Decimal(12, 2) @default(0)
+  lineTotal          Decimal  @db.Decimal(12, 2)
+  createdAt          DateTime @default(now())
+
+  sale        Sale                      @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  product     Product                   @relation(fields: [productId], references: [id], onDelete: Restrict)
+  allocations SaleItemBatchAllocation[]
+  returnItems ReturnItem[]
+
+  @@index([saleId])
+  @@index([productId])
+}
+
+// The linchpin table (docs/08-database-schema.md §3): exact FIFO allocation
+// per sale item, cost snapshotted at time of sale.
+model SaleItemBatchAllocation {
+  id               String   @id // ULID
+  saleItemId       String
+  batchId          String
+  quantity         Decimal  @db.Decimal(12, 2)
+  unitCostAtSale   Decimal  @db.Decimal(12, 2) // copied from batch.unitCost at sale time
+  createdAt        DateTime @default(now())
+
+  saleItem SaleItem       @relation(fields: [saleItemId], references: [id], onDelete: Restrict)
+  batch    InventoryBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+
+  @@index([saleItemId])
+  @@index([batchId])
+}
+
+// Initial point-of-sale payment (one per Sale, since split payments are out
+// of scope for V1 — BR-013). Distinct from KhataPayment, which is a later
+// standalone Khata collection event.
+model Payment {
+  id         String        @id // ULID
+  saleId     String
+  amount     Decimal       @db.Decimal(12, 2)
+  method     PaymentMethod
+  receivedAt DateTime      @default(now())
+  createdAt  DateTime      @default(now())
+
+  sale Sale @relation(fields: [saleId], references: [id], onDelete: Restrict)
+
+  @@index([saleId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Returns
+// ─────────────────────────────────────────────────────────────────────────
+
+model Return {
+  id            String       @id // ULID
+  saleId        String
+  processedById String
+  shiftId       String? // the shift a cash refund was drawn from (FR-092) — not necessarily the original sale's shift
+  reason        String?
+  status        ReturnStatus @default(COMPLETED)
+  occurredAt    DateTime     @default(now())
+  createdAt     DateTime     @default(now())
+
+  sale          Sale               @relation(fields: [saleId], references: [id], onDelete: Restrict)
+  processedBy   User               @relation("ReturnProcessedBy", fields: [processedById], references: [id], onDelete: Restrict)
+  shift         Shift?             @relation(fields: [shiftId], references: [id], onDelete: Restrict)
+  items         ReturnItem[]
+  khataTransactions KhataTransaction[]
+
+  @@index([saleId])
+  @@index([shiftId])
+}
+
+model ReturnItem {
+  id           String   @id // ULID
+  returnId     String
+  saleItemId   String
+  quantity     Decimal  @db.Decimal(12, 2)
+  refundAmount Decimal  @db.Decimal(12, 2)
+  createdAt    DateTime @default(now())
+
+  return   Return                   @relation(fields: [returnId], references: [id], onDelete: Restrict)
+  saleItem SaleItem                 @relation(fields: [saleItemId], references: [id], onDelete: Restrict)
+  restocks ReturnItemBatchRestock[]
+
+  @@index([returnId])
+  @@index([saleItemId])
+}
+
+// Mirrors SaleItemBatchAllocation: restocks the exact original batch(es)
+// (Decision #3 / BR-017), proportional to the original sale's split.
+model ReturnItemBatchRestock {
+  id           String   @id // ULID
+  returnItemId String
+  batchId      String
+  quantity     Decimal  @db.Decimal(12, 2)
+  createdAt    DateTime @default(now())
+
+  returnItem ReturnItem     @relation(fields: [returnItemId], references: [id], onDelete: Restrict)
+  batch      InventoryBatch @relation(fields: [batchId], references: [id], onDelete: Restrict)
+
+  @@index([returnItemId])
+  @@index([batchId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Expenses
+// ─────────────────────────────────────────────────────────────────────────
+
+model Expense {
+  id            String          @id // ULID
+  category      ExpenseCategory
+  description   String
+  amount        Decimal         @db.Decimal(12, 2)
+  // Not in the original spec's expense field list (§29), but FR-092's cash
+  // reconciliation formula requires distinguishing cash expenses from
+  // non-cash ones — an implementation-time gap, resolved here by requiring
+  // it explicitly rather than silently assuming cash (see PurchasesService/
+  // ExpensesService for how it's used).
+  paymentMethod PaymentMethod
+  date          DateTime
+  addedById     String
+  shiftId       String? // the shift a cash expense was drawn from, if any (FR-092)
+  receiptUrl    String?
+  createdAt     DateTime        @default(now())
+
+  addedBy User   @relation("ExpenseAddedBy", fields: [addedById], references: [id], onDelete: Restrict)
+  shift   Shift? @relation(fields: [shiftId], references: [id], onDelete: Restrict)
+
+  @@index([date])
+  @@index([category])
+  @@index([shiftId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Admin step-up override (docs/07-architecture-detailed.md §6.2, BR-011/SEC-010)
+// ─────────────────────────────────────────────────────────────────────────
+
+model OverrideAuthorization {
+  id            String    @id // ULID
+  adminId       String
+  saleClientId  String // the not-yet-created Sale's client-supplied ULID (see docs/09-api-design.md §8) —
+                        // deliberately NOT a foreign key: the token is issued before the Sale row exists.
+  saleId        String? // set once the sale actually commits, for a queryable audit link (FK is valid then).
+  reason        String?
+  expiresAt     DateTime
+  usedAt        DateTime?
+  createdAt     DateTime  @default(now())
+
+  admin User  @relation("OverrideAdmin", fields: [adminId], references: [id], onDelete: Restrict)
+  sale  Sale? @relation(fields: [saleId], references: [id], onDelete: Restrict)
+
+  @@index([saleId])
+  @@index([saleClientId])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Audit — append-only (SEC-006: app DB role has INSERT-only grant on this table)
+// ─────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id // ULID
+  userId     String?
+  action     String // e.g. "SALE_CREATED", "PRICE_OVERRIDE", "INVOICE_CANCELLED"
+  entityType String // polymorphic — intentionally no FK, see docs/08-database-schema.md §4
+  entityId   String
+  beforeJson Json?
+  afterJson  Json?
+  reason     String?
+  deviceId   String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Sync (local → cloud, one-way, SYNC-002)
+// ─────────────────────────────────────────────────────────────────────────
+
+model OutboxEvent {
+  id          String    @id // ULID — same value used as the cloud idempotency key
+  entityType  String // polymorphic, see docs/08-database-schema.md §4
+  entityId    String
+  payload     Json // full snapshot at enqueue time
+  state       SyncState @default(LOCAL_ONLY)
+  attempts    Int       @default(0)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  syncedAt    DateTime?
+  // Backoff schedule (docs/10-offline-engine.md §5): null means "eligible
+  // now"; the worker sets this on failure to baseDelay * 2^attempts + jitter.
+  nextAttemptAt DateTime?
+
+  conflicts SyncConflict[]
+
+  @@index([state])
+  @@index([createdAt])
+  @@index([entityType, entityId])
+  @@index([state, nextAttemptAt])
+}
+
+model SyncConflict {
+  id            String              @id // ULID
+  outboxEventId String
+  details       Json
+  status        SyncConflictStatus  @default(OPEN)
+  resolvedBy    String?
+  resolvedAt    DateTime?
+  createdAt     DateTime            @default(now())
+
+  outboxEvent OutboxEvent @relation(fields: [outboxEventId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Misc reference
+// ─────────────────────────────────────────────────────────────────────────
+
+model Device {
+  id         String     @id @default(cuid())
+  name       String
+  type       DeviceType
+  lastSeenAt DateTime?
+  createdAt  DateTime   @default(now())
+}
+
+// Configurable business settings (e.g. cashier discount cap, Decision #1)
+// instead of hardcoded values in the application (§57 coding rules).
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}

@@ -1,0 +1,44 @@
+# Local development only. The shop's real Local Shop Server deployment
+# (docs/07-architecture-detailed.md §2) uses this same shape in production,
+# minus the convenience of exposing the Postgres port to the host.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shop_local
+    ports:
+      - "5432:5432"
+    volumes:
+      - shop_local_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Simulates the cloud Postgres for local end-to-end sync testing (local
+  # server <-> cloud API). In real deployment this is a separate managed
+  # instance, not a container next to the shop's own database.
+  postgres-cloud:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shop_cloud
+    ports:
+      - "5433:5432"
+    volumes:
+      - shop_cloud_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  shop_local_pgdata:
+  shop_cloud_pgdata:
