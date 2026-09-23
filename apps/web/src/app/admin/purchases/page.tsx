@@ -95,12 +95,14 @@ export default function PurchasesPage() {
               <input required type="number" min={0} placeholder="Cost per unit" value={line.costPerUnit} onChange={(e) => updateLine(i, { costPerUnit: e.target.value })} className="rounded-md border border-neutral-300 px-3 py-2" />
             </div>
           ))}
-          <button type="button" onClick={() => setLines((prev) => [...prev, { productId: "", quantity: "", costPerUnit: "" }])} className="mb-3 text-sm text-neutral-500 underline underline-offset-2">
-            + Add line
-          </button>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <button type="button" onClick={() => setLines((prev) => [...prev, { productId: "", quantity: "", costPerUnit: "" }])} className="text-sm text-neutral-500 underline underline-offset-2">
+              + Add line
+            </button>
+            <button type="submit" className="rounded-md bg-neutral-900 px-4 py-2 font-medium text-white">Save Purchase</button>
+          </div>
 
           {error && <p className="mb-3 text-sm text-red-600">{error}</p>}
-          <button type="submit" className="rounded-md bg-neutral-900 px-4 py-2 font-medium text-white">Save Purchase</button>
         </form>
       )}
 
