@@ -117,9 +117,21 @@ model User {
   pinHash      String? // Cashier quick-login (SEC-002)
   role         UserRole
   status       EntityStatus @default(ACTIVE)
+  createdById  String? // which Admin created this account (nullable: seed-created accounts have none)
+  // Brute-force protection (mandatory per the audit: "rate limiting/lockout
+  // protection"). Applies to both Admin password login (account identified
+  // upfront by username, so this is a normal per-account lockout) and
+  // Cashier PIN login (identified only on a successful match — see
+  // AuthService.loginPin's comments for how lockout still applies there).
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  lastLoginAt         DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  createdBy               User?                   @relation("UserCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  usersCreated             User[]                  @relation("UserCreatedBy")
+  cashierProfile           CashierProfile?
   shifts                  Shift[]
   salesAsCashier          Sale[]                 @relation("SaleCashier")
   salesCancelled          Sale[]                 @relation("SaleCancelledBy")
@@ -133,6 +145,47 @@ model User {
   overrideAuthorizations  OverrideAuthorization[] @relation("OverrideAdmin")
 
   @@index([role, status])
+}
+
+// 1:1 with a CASHIER User. Everything here is admin-configurable per the
+// mandatory "Admin must control cashiers" requirement: which counter this
+// cashier is assigned to, which dashboard modules/widgets they see, and
+// which sensitive actions they're allowed to perform. The action flags are
+// real backend enforcement points (checked in the relevant services), not
+// just frontend show/hide — see docs/08-database-schema.md's amendments.
+// Dashboard modules/widgets are lower-stakes (display-only) so they're kept
+// as a JSON set rather than one column per toggle.
+model CashierProfile {
+  id        String  @id // ULID
+  userId    String  @unique
+  counterId String?
+
+  // { pos, sales, products, customers, khata, inventory, purchases,
+  //   suppliers, returns, expenses, reports, shift, notifications: boolean }
+  dashboardModules Json
+  // { todaysSales, currentShift, currentCash, lowStock, customerDue,
+  //   recentSales, quickProducts, pendingSync, notifications: boolean }
+  dashboardWidgets Json
+
+  canEditPrice            Boolean @default(true)
+  canApplyDiscount        Boolean @default(true)
+  canCreateCustomer       Boolean @default(true)
+  canCollectKhataPayment  Boolean @default(true)
+  canProcessReturn        Boolean @default(false)
+  canCancelInvoice        Boolean @default(false)
+  canReprintInvoice       Boolean @default(true)
+  canViewPreviousInvoices Boolean @default(true)
+  canScanBarcode          Boolean @default(true)
+  canViewStock            Boolean @default(true)
+  canOpenCloseShift       Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  counter Counter? @relation(fields: [counterId], references: [id], onDelete: SetNull)
+
+  @@index([counterId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -396,8 +449,9 @@ model Counter {
   name      String   @unique // e.g. "C1", "C2" — used in invoice numbering (Decision #5)
   createdAt DateTime @default(now())
 
-  shifts Shift[]
-  sales  Sale[]
+  shifts          Shift[]
+  sales           Sale[]
+  cashierProfiles CashierProfile[]
 }
 
 // Backs the offline-safe invoice numbering scheme (Decision #5):

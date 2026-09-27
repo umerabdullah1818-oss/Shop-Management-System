@@ -41,6 +41,8 @@ export class SyncService {
       Category: this.prisma.category,
       Product: this.prisma.product,
       Counter: this.prisma.counter,
+      User: this.prisma.user,
+      CashierProfile: this.prisma.cashierProfile,
     };
     return map[entityType] ?? null;
   }

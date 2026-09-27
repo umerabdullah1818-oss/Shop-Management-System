@@ -2,13 +2,15 @@ import { ErrorCode, newId } from "@shop/shared";
 import { InventoryService } from "../src/inventory/inventory.service";
 import { SalesService } from "../src/sales/sales.service";
 import { CustomersService } from "../src/customers/customers.service";
+import { PermissionsService } from "../src/users/permissions.service";
 import { createTestPrisma, cleanDatabase } from "./db";
 import { seedBaseline, createProduct, createBatch, openShift } from "./fixtures";
 
 const prisma = createTestPrisma();
 const inventoryService = new InventoryService(prisma);
-const salesService = new SalesService(prisma, inventoryService);
-const customersService = new CustomersService(prisma);
+const permissionsService = new PermissionsService(prisma);
+const salesService = new SalesService(prisma, inventoryService, permissionsService);
+const customersService = new CustomersService(prisma, permissionsService);
 
 beforeAll(async () => {
   await prisma.$connect();
@@ -217,7 +219,7 @@ describe("Khata oldest-invoice-first payment allocation (worked example from §2
     const result = await customersService.recordKhataPayment(
       realCustomer.id,
       { id: newId(), amount: 6000, method: "CASH" },
-      admin.id,
+      user,
     );
 
     expect(result.allocations).toEqual([

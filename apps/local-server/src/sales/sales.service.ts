@@ -12,6 +12,7 @@ import { recordOutbox } from "../sync/outbox.util";
 import { CreateSaleDto } from "./dto/create-sale.dto";
 import { CancelSaleDto } from "./dto/cancel-sale.dto";
 import { AuthenticatedUser } from "../auth/auth.types";
+import { PermissionsService } from "../users/permissions.service";
 
 interface ComputedItem {
   productId: string;
@@ -29,16 +30,32 @@ export class SalesService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly inventoryService: InventoryService,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
-  findAll(
+  async findAll(
     user: AuthenticatedUser,
     params: { cashierId?: string; customerId?: string; status?: SaleStatus; dateFrom?: string; dateTo?: string },
   ) {
+    // Cashier action: "view previous invoices". Without it, a cashier can
+    // only see invoices from their own CURRENTLY OPEN shift — the current
+    // till, not their whole history.
+    let currentShiftId: string | undefined;
+    if (user.role === "CASHIER") {
+      const permissions = await this.permissionsService.getActionPermissions(user);
+      if (!permissions.canViewPreviousInvoices) {
+        const openShift = await this.prisma.shift.findFirst({
+          where: { userId: user.id, status: ShiftStatus.OPEN },
+        });
+        currentShiftId = openShift?.id ?? "__none__"; // no open shift → no visible invoices
+      }
+    }
+
     return this.prisma.sale.findMany({
       where: {
         // FR: Cashier sees own shift/day sales only; Admin sees everything (§9 role matrix).
         ...(user.role === "CASHIER" ? { cashierId: user.id } : {}),
+        ...(currentShiftId ? { shiftId: currentShiftId } : {}),
         ...(params.cashierId ? { cashierId: params.cashierId } : {}),
         ...(params.customerId ? { customerId: params.customerId } : {}),
         ...(params.status ? { status: params.status } : {}),
@@ -69,8 +86,24 @@ export class SalesService {
     if (!sale) {
       throw new DomainError(ErrorCode.NOT_FOUND, "Sale not found.", { id }, 404);
     }
-    if (user.role === "CASHIER" && sale.cashierId !== user.id) {
-      throw new DomainError(ErrorCode.FORBIDDEN, "You can only view your own sales.", undefined, 403);
+    if (user.role === "CASHIER") {
+      if (sale.cashierId !== user.id) {
+        throw new DomainError(ErrorCode.FORBIDDEN, "You can only view your own sales.", undefined, 403);
+      }
+      const permissions = await this.permissionsService.getActionPermissions(user);
+      if (!permissions.canViewPreviousInvoices) {
+        const openShift = await this.prisma.shift.findFirst({
+          where: { userId: user.id, status: ShiftStatus.OPEN },
+        });
+        if (!openShift || sale.shiftId !== openShift.id) {
+          throw new DomainError(
+            ErrorCode.FORBIDDEN,
+            "You don't have permission to view invoices from a previous shift. Ask an admin.",
+            undefined,
+            403,
+          );
+        }
+      }
     }
     return sale;
   }
@@ -111,10 +144,32 @@ export class SalesService {
       }
       const isAdmin = user.role === "ADMIN";
 
+      const actionPermissions = await this.permissionsService.getActionPermissions(user);
+
       const computedItems: ComputedItem[] = [];
       for (const item of dto.items) {
         const product = await tx.product.findUniqueOrThrow({ where: { id: item.productId } });
         const discountAmount = item.discountAmount ?? 0;
+
+        // Cashier actions "edit selling price" / "apply discount" — checked
+        // server-side, not just hidden in the POS UI (audit §4).
+        if (item.unitPrice !== Number(product.officialPrice) && !actionPermissions.canEditPrice) {
+          throw new DomainError(
+            ErrorCode.FORBIDDEN,
+            "You don't have permission to change the selling price. Ask an admin.",
+            { productId: item.productId },
+            403,
+          );
+        }
+        if (discountAmount > 0 && !actionPermissions.canApplyDiscount) {
+          throw new DomainError(
+            ErrorCode.FORBIDDEN,
+            "You don't have permission to apply a discount. Ask an admin.",
+            { productId: item.productId },
+            403,
+          );
+        }
+
         const lineSubtotal = item.quantity * item.unitPrice;
         const lineTotal = lineSubtotal - discountAmount;
         const effectiveUnitPrice = lineTotal / item.quantity;
@@ -288,6 +343,14 @@ export class SalesService {
   /** FR-070/BR-012/BR-019: void, not delete; fully reverses inventory,
    * revenue, COGS, payment, and Khata effects atomically. */
   async cancel(id: string, dto: CancelSaleDto, user: AuthenticatedUser) {
+    if (user.role === "CASHIER") {
+      await this.permissionsService.assert(
+        user,
+        "canCancelInvoice",
+        "You don't have permission to cancel invoices. Ask an admin.",
+      );
+    }
+
     return this.prisma.$transaction(async (tx) => {
       const sale = await tx.sale.findUniqueOrThrow({
         where: { id },
@@ -378,6 +441,13 @@ export class SalesService {
   // FR-111: logged, but a pure side-effect — no financial fields touched.
   async recordPrint(id: string, user: AuthenticatedUser) {
     await this.findOne(id, user); // 404s / scope-checks the same way a normal view would
+    if (user.role === "CASHIER") {
+      await this.permissionsService.assert(
+        user,
+        "canReprintInvoice",
+        "You don't have permission to reprint invoices. Ask an admin.",
+      );
+    }
     return this.prisma.$transaction(async (tx) => {
       const audit = await tx.auditLog.create({
         data: { id: newId(), userId: user.id, action: "INVOICE_PRINTED", entityType: "Sale", entityId: id },

@@ -10,6 +10,9 @@ import { LoginPinDto } from "./dto/login-pin.dto";
 import { StepUpDto } from "./dto/step-up.dto";
 import { AuthenticatedUser, JwtPayload } from "./auth.types";
 
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_MINUTES = 15;
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -28,6 +31,20 @@ export class AuthService {
     throw new DomainError(ErrorCode.INVALID_CREDENTIALS, "Invalid credentials.", undefined, 401);
   }
 
+  private accountLocked(lockedUntil: Date): never {
+    throw new DomainError(
+      ErrorCode.INVALID_CREDENTIALS,
+      `Account temporarily locked after repeated failed attempts. Try again after ${lockedUntil.toLocaleTimeString()}.`,
+      undefined,
+      401,
+    );
+  }
+
+  /**
+   * Admin username+password login identifies the account up front, so a
+   * normal per-account lockout applies cleanly (audit §3: "rate
+   * limiting/lockout protection where appropriate").
+   */
   async login(dto: LoginDto) {
     const user = await this.prisma.user.findUnique({ where: { username: dto.username } });
 
@@ -35,26 +52,57 @@ export class AuthService {
       this.invalidCredentials();
     }
 
+    if (user.lockedUntil && user.lockedUntil > new Date()) {
+      this.accountLocked(user.lockedUntil);
+    }
+
     const ok = await bcrypt.compare(dto.password, user.passwordHash as string);
     if (!ok) {
+      await this.registerFailedAttempt(user.id, user.failedLoginAttempts);
       this.invalidCredentials();
     }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: { failedLoginAttempts: 0, lockedUntil: null, lastLoginAt: new Date() },
+    });
 
     const token = this.issueToken(user);
     return { token, user: { id: user.id, name: user.name, role: user.role } };
   }
 
+  private async registerFailedAttempt(userId: string, currentAttempts: number) {
+    const attempts = currentAttempts + 1;
+    const lockedUntil =
+      attempts >= MAX_FAILED_ATTEMPTS ? new Date(Date.now() + LOCKOUT_MINUTES * 60_000) : null;
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { failedLoginAttempts: attempts, lockedUntil },
+    });
+  }
+
   async loginPin(dto: LoginPinDto) {
     // PIN lookup scans active cashiers rather than taking a username, per
     // the fast quick-login UX (Decision #17) — bounded candidate set (shop
-    // staff count is small), and rate-limited at the HTTP layer (SEC-005
-    // equivalent) against brute-forcing.
+    // staff count is small). Deliberately NOT applying per-account lockout
+    // here: incrementing every active cashier's failedLoginAttempts on each
+    // wrong guess would let one attacker lock out the entire shop floor.
+    // Brute-force protection for this endpoint is IP-based (ThrottlerGuard,
+    // see auth.controller.ts), which does not have that shared-fate problem.
+    // Per-account lockedUntil is still honored here (set via the Admin
+    // password path or a future targeted-lockout mechanism) so a locked
+    // cashier account can't be used even if guessed correctly.
     const candidates = await this.prisma.user.findMany({
       where: { status: EntityStatus.ACTIVE, pinHash: { not: null } },
     });
 
     for (const candidate of candidates) {
+      if (candidate.lockedUntil && candidate.lockedUntil > new Date()) continue;
       if (candidate.pinHash && (await bcrypt.compare(dto.pin, candidate.pinHash))) {
+        await this.prisma.user.update({
+          where: { id: candidate.id },
+          data: { lastLoginAt: new Date() },
+        });
         const token = this.issueToken(candidate);
         return { token, user: { id: candidate.id, name: candidate.name, role: candidate.role } };
       }

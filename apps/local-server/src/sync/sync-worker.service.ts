@@ -50,21 +50,27 @@ export class SyncWorkerService {
     }
 
     const now = new Date();
-    const events = await this.prisma.outboxEvent.findMany({
-      where: {
-        state: { in: [SyncState.LOCAL_ONLY, SyncState.PENDING_SYNC, SyncState.SYNC_FAILED] },
-        OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
-      },
-      // Ordered by id (a ULID), not createdAt: Postgres's now() is stable
-      // for an entire transaction, so multiple rows written in one sale/
-      // return/etc. transaction would tie on createdAt. The ULID is
-      // generated in application code at each individual recordOutbox()
-      // call, so it's the value that actually preserves true creation
-      // order — which matters here since dependent rows (e.g. a SaleItem)
-      // must reach the cloud after the row they reference (the Sale).
+    // Fetched WITHOUT an eligibility (nextAttemptAt) filter, then trimmed to
+    // a leading prefix below. A plain `WHERE nextAttemptAt <= now` would let
+    // a later-created row with a SHORTER backoff (e.g. a Sale that only
+    // failed once) jump ahead of an earlier-created row it depends on that's
+    // still backing off (e.g. its Shift, which failed more times and so has
+    // a longer delay) — retrying the dependent alone, hitting the same FK
+    // violation, extending its own backoff on a schedule decorrelated from
+    // the dependency's, and repeating. Stopping at the first ineligible
+    // event instead preserves the id-order (= dependency-order) guarantee
+    // the cloud's sequential ingest relies on.
+    const candidates = await this.prisma.outboxEvent.findMany({
+      where: { state: { in: [SyncState.LOCAL_ONLY, SyncState.PENDING_SYNC, SyncState.SYNC_FAILED] } },
       orderBy: { id: "asc" },
       take: BATCH_SIZE,
     });
+
+    const events: typeof candidates = [];
+    for (const candidate of candidates) {
+      if (candidate.nextAttemptAt && candidate.nextAttemptAt > now) break;
+      events.push(candidate);
+    }
 
     if (events.length === 0) return;
 

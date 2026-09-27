@@ -21,8 +21,8 @@ export class CustomersController {
   }
 
   @Post()
-  create(@Body() dto: CreateCustomerDto) {
-    return this.customersService.create(dto);
+  create(@Body() dto: CreateCustomerDto, @CurrentUser() user: AuthenticatedUser) {
+    return this.customersService.create(dto, user);
   }
 
   @Get(":id/khata")
@@ -36,6 +36,6 @@ export class CustomersController {
     @Body() dto: CreateKhataPaymentDto,
     @CurrentUser() user: AuthenticatedUser,
   ) {
-    return this.customersService.recordKhataPayment(id, dto, user.id);
+    return this.customersService.recordKhataPayment(id, dto, user);
   }
 }

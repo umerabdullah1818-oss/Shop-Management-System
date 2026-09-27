@@ -39,6 +39,77 @@ services:
       timeout: 5s
       retries: 10
 
+  local-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >-
+      sh -c "pnpm --filter @shop/database exec prisma migrate deploy &&
+      pnpm --filter @shop/local-server exec nest start --watch"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/shop_local?schema=public
+      PORT: 3000
+      JWT_SECRET: local-docker-development-secret-change-before-deployment
+      JWT_EXPIRES_IN: 12h
+      OVERRIDE_TOKEN_TTL_SECONDS: 120
+      CLOUD_API_URL: http://cloud-api:4000/api/v1
+      CLOUD_DEVICE_API_KEY: local-docker-device-key
+      CASHIER_DISCOUNT_CAP_PERCENT: 10
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      cloud-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/v1/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  cloud-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: >-
+      sh -c "pnpm --filter @shop/database exec prisma migrate deploy &&
+      pnpm --filter @shop/cloud-api exec nest start --watch"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres-cloud:5432/shop_cloud?schema=public
+      PORT: 4000
+      JWT_SECRET: cloud-docker-development-secret-change-before-deployment
+      JWT_EXPIRES_IN: 12h
+      DEVICE_API_KEYS: local-docker-device-key
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres-cloud:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/v1/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: pnpm --filter @shop/web exec next dev --hostname 0.0.0.0 --port 3002
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3000/api/v1
+    ports:
+      - "3002:3002"
+    depends_on:
+      local-server:
+        condition: service_healthy
+
 volumes:
   shop_local_pgdata:
   shop_cloud_pgdata:

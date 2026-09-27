@@ -27,7 +27,7 @@ export class ShiftsController {
 
   @Post("open")
   open(@Body() dto: OpenShiftDto, @CurrentUser() user: AuthenticatedUser) {
-    return this.shiftsService.open(dto, user.id);
+    return this.shiftsService.open(dto, user);
   }
 
   @Post(":id/close")

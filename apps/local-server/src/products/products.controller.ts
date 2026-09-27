@@ -1,6 +1,8 @@
 import { Body, Controller, Get, Param, Patch, Post, Query } from "@nestjs/common";
 import { UserRole } from "@shop/database";
 import { Roles } from "../common/decorators/roles.decorator";
+import { CurrentUser } from "../common/decorators/current-user.decorator";
+import { AuthenticatedUser } from "../auth/auth.types";
 import { InventoryService } from "../inventory/inventory.service";
 import { ProductsService } from "./products.service";
 import { CreateProductDto } from "./dto/create-product.dto";
@@ -22,15 +24,19 @@ export class ProductsController {
 
   @Get()
   findAll(
+    @CurrentUser() user: AuthenticatedUser,
     @Query("search") search?: string,
     @Query("categoryId") categoryId?: string,
     @Query("status") status?: string,
   ) {
-    return this.productsService.findAll({
-      search,
-      categoryId,
-      includeDisabled: status === "DISABLED" || status === "ALL",
-    });
+    return this.productsService.findAll(
+      {
+        search,
+        categoryId,
+        includeDisabled: status === "DISABLED" || status === "ALL",
+      },
+      user,
+    );
   }
 
   @Roles(UserRole.ADMIN)
@@ -40,8 +46,8 @@ export class ProductsController {
   }
 
   @Get(":id")
-  findOne(@Param("id") id: string) {
-    return this.productsService.findOne(id);
+  findOne(@Param("id") id: string, @CurrentUser() user: AuthenticatedUser) {
+    return this.productsService.findOne(id, user);
   }
 
   @Roles(UserRole.ADMIN)

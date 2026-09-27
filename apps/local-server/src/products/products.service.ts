@@ -1,10 +1,12 @@
 import { Injectable } from "@nestjs/common";
-import { EntityStatus, Prisma } from "@shop/database";
+import { BatchStatus, EntityStatus, Prisma } from "@shop/database";
 import { DomainError, ErrorCode, newId } from "@shop/shared";
 import { PrismaService } from "../prisma/prisma.service";
 import { recordOutbox } from "../sync/outbox.util";
 import { CreateProductDto } from "./dto/create-product.dto";
 import { UpdateProductDto } from "./dto/update-product.dto";
+import { AuthenticatedUser } from "../auth/auth.types";
+import { PermissionsService } from "../users/permissions.service";
 
 interface FindAllParams {
   search?: string;
@@ -14,11 +16,14 @@ interface FindAllParams {
 
 @Injectable()
 export class ProductsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly permissionsService: PermissionsService,
+  ) {}
 
   // FR-004: search by name/SKU/barcode; POS search excludes disabled products
   // by default (includeDisabled is only ever passed by the Admin UI).
-  findAll(params: FindAllParams) {
+  async findAll(params: FindAllParams, user: AuthenticatedUser) {
     const { search, categoryId, includeDisabled } = params;
     const where: Prisma.ProductWhereInput = {
       ...(includeDisabled ? {} : { status: EntityStatus.ACTIVE }),
@@ -33,15 +38,39 @@ export class ProductsService {
           }
         : {}),
     };
-    return this.prisma.product.findMany({ where, orderBy: { name: "asc" } });
+    const products = await this.prisma.product.findMany({ where, orderBy: { name: "asc" } });
+    return this.withStock(products, user);
   }
 
-  async findOne(id: string) {
+  async findOne(id: string, user: AuthenticatedUser) {
     const product = await this.prisma.product.findUnique({ where: { id } });
     if (!product) {
       throw new DomainError(ErrorCode.NOT_FOUND, "Product not found.", { id }, 404);
     }
-    return product;
+    const [withStock] = await this.withStock([product], user);
+    return withStock;
+  }
+
+  // Cashier action "view stock" (audit §4) — enforced here, not just hidden
+  // in the POS UI: a cashier without the permission gets every product's
+  // currentStock omitted from the API response entirely, not merely masked
+  // client-side.
+  private async withStock<T extends { id: string }>(products: T[], user: AuthenticatedUser) {
+    if (user.role === "CASHIER") {
+      const permissions = await this.permissionsService.getActionPermissions(user);
+      if (!permissions.canViewStock) {
+        return products;
+      }
+    }
+    if (products.length === 0) return products;
+
+    const sums = await this.prisma.inventoryBatch.groupBy({
+      by: ["productId"],
+      where: { productId: { in: products.map((p) => p.id) }, status: BatchStatus.ACTIVE },
+      _sum: { remainingQty: true },
+    });
+    const stockByProduct = new Map(sums.map((s) => [s.productId, Number(s._sum.remainingQty ?? 0)]));
+    return products.map((p) => ({ ...p, currentStock: stockByProduct.get(p.id) ?? 0 }));
   }
 
   // FR-003: duplicate SKU/barcode is a clear validation error, not a raw
@@ -68,7 +97,7 @@ export class ProductsService {
   }
 
   async update(id: string, dto: UpdateProductDto) {
-    await this.findOne(id);
+    await this.assertExists(id);
     if (dto.sku || dto.barcode) {
       await this.assertNoDuplicate({ sku: dto.sku, barcode: dto.barcode, excludeId: id });
     }
@@ -81,12 +110,19 @@ export class ProductsService {
 
   // BR-001: soft-delete only, never hard-deleted.
   async disable(id: string) {
-    await this.findOne(id);
+    await this.assertExists(id);
     return this.prisma.$transaction(async (tx) => {
       const product = await tx.product.update({ where: { id }, data: { status: EntityStatus.DISABLED } });
       await recordOutbox(tx, "Product", product.id, product);
       return product;
     });
+  }
+
+  private async assertExists(id: string) {
+    const product = await this.prisma.product.findUnique({ where: { id } });
+    if (!product) {
+      throw new DomainError(ErrorCode.NOT_FOUND, "Product not found.", { id }, 404);
+    }
   }
 
   private async assertNoDuplicate(opts: { sku?: string; barcode?: string; excludeId?: string }) {

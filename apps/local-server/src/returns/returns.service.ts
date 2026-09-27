@@ -6,12 +6,14 @@ import { InventoryService } from "../inventory/inventory.service";
 import { recordOutbox } from "../sync/outbox.util";
 import { CreateReturnDto } from "./dto/create-return.dto";
 import { AuthenticatedUser } from "../auth/auth.types";
+import { PermissionsService } from "../users/permissions.service";
 
 @Injectable()
 export class ReturnsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly inventoryService: InventoryService,
+    private readonly permissionsService: PermissionsService,
   ) {}
 
   findBySale(saleId: string) {
@@ -30,6 +32,13 @@ export class ReturnsService {
    * of them) that avoids fractional/proportional splitting across batches.
    */
   async create(dto: CreateReturnDto, user: AuthenticatedUser) {
+    if (user.role === "CASHIER") {
+      await this.permissionsService.assert(
+        user,
+        "canProcessReturn",
+        "You don't have permission to process returns. Ask an admin.",
+      );
+    }
     return this.prisma.$transaction(async (tx) => {
       const existing = await tx.return.findUnique({ where: { id: dto.id } });
       if (existing) return existing; // idempotent replay

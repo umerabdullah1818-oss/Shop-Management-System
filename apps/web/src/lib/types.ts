@@ -33,6 +33,51 @@ export interface Customer {
   isWalkIn: boolean;
 }
 
+export interface Counter {
+  id: string;
+  name: string;
+}
+
+export interface CashierProfile {
+  id: string;
+  userId: string;
+  counterId: string | null;
+  dashboardModules: import("@shop/shared").DashboardModules;
+  dashboardWidgets: import("@shop/shared").DashboardWidgets;
+  canEditPrice: boolean;
+  canApplyDiscount: boolean;
+  canCreateCustomer: boolean;
+  canCollectKhataPayment: boolean;
+  canProcessReturn: boolean;
+  canCancelInvoice: boolean;
+  canReprintInvoice: boolean;
+  canViewPreviousInvoices: boolean;
+  canScanBarcode: boolean;
+  canViewStock: boolean;
+  canOpenCloseShift: boolean;
+  counter?: Counter | null;
+}
+
+export interface ManagedUser {
+  id: string;
+  name: string;
+  username: string | null;
+  role: UserRole;
+  status: "ACTIVE" | "DISABLED";
+  createdById: string | null;
+  failedLoginAttempts: number;
+  lockedUntil: string | null;
+  lastLoginAt: string | null;
+  createdAt: string;
+  cashierProfile: CashierProfile | null;
+}
+
+export interface UserActivity {
+  auditLogs: { id: string; action: string; entityType: string; entityId: string; createdAt: string; reason: string | null }[];
+  shifts: { id: string; status: string; openedAt: string; closedAt: string | null }[];
+  totalSales: number;
+}
+
 export type PaymentMethod = "CASH" | "CARD" | "BANK" | "KHATA";
 
 export interface SaleItemInput {

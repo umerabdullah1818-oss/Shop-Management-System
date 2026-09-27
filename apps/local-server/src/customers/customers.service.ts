@@ -5,10 +5,15 @@ import { PrismaService } from "../prisma/prisma.service";
 import { recordOutbox } from "../sync/outbox.util";
 import { CreateCustomerDto } from "./dto/create-customer.dto";
 import { CreateKhataPaymentDto } from "./dto/create-khata-payment.dto";
+import { AuthenticatedUser } from "../auth/auth.types";
+import { PermissionsService } from "../users/permissions.service";
 
 @Injectable()
 export class CustomersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly permissionsService: PermissionsService,
+  ) {}
 
   findAll(search?: string) {
     return this.prisma.customer.findMany({
@@ -30,8 +35,16 @@ export class CustomersService {
     return customer;
   }
 
-  // FR-030: Cashier and Admin can both create customers.
-  async create(dto: CreateCustomerDto) {
+  // FR-030: Cashier and Admin can both create customers, subject to the
+  // cashier's own "create customer" action permission (audit §4).
+  async create(dto: CreateCustomerDto, user: AuthenticatedUser) {
+    if (user.role === "CASHIER") {
+      await this.permissionsService.assert(
+        user,
+        "canCreateCustomer",
+        "You don't have permission to create customers. Ask an admin.",
+      );
+    }
     const existing = await this.prisma.customer.findUnique({ where: { id: dto.id } });
     if (existing) return existing; // idempotent replay
 
@@ -66,7 +79,15 @@ export class CustomersService {
    * exhausted — no manual invoice selection, per the worked example in
    * docs/06-srs.md §3.4 / the original spec §22.
    */
-  async recordKhataPayment(customerId: string, dto: CreateKhataPaymentDto, userId: string) {
+  async recordKhataPayment(customerId: string, dto: CreateKhataPaymentDto, user: AuthenticatedUser) {
+    if (user.role === "CASHIER") {
+      await this.permissionsService.assert(
+        user,
+        "canCollectKhataPayment",
+        "You don't have permission to collect Khata payments. Ask an admin.",
+      );
+    }
+    const userId = user.id;
     await this.findOne(customerId);
 
     return this.prisma.$transaction(async (tx) => {

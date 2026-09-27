@@ -2,13 +2,15 @@ import { newId } from "@shop/shared";
 import { InventoryService } from "../src/inventory/inventory.service";
 import { SalesService } from "../src/sales/sales.service";
 import { ReturnsService } from "../src/returns/returns.service";
+import { PermissionsService } from "../src/users/permissions.service";
 import { createTestPrisma, cleanDatabase } from "./db";
 import { seedBaseline, createProduct, createBatch, openShift } from "./fixtures";
 
 const prisma = createTestPrisma();
 const inventoryService = new InventoryService(prisma);
-const salesService = new SalesService(prisma, inventoryService);
-const returnsService = new ReturnsService(prisma, inventoryService);
+const permissionsService = new PermissionsService(prisma);
+const salesService = new SalesService(prisma, inventoryService, permissionsService);
+const returnsService = new ReturnsService(prisma, inventoryService, permissionsService);
 
 beforeAll(async () => {
   await prisma.$connect();

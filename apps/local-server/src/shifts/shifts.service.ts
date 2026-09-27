@@ -6,10 +6,14 @@ import { recordOutbox } from "../sync/outbox.util";
 import { OpenShiftDto } from "./dto/open-shift.dto";
 import { CloseShiftDto } from "./dto/close-shift.dto";
 import { AuthenticatedUser } from "../auth/auth.types";
+import { PermissionsService } from "../users/permissions.service";
 
 @Injectable()
 export class ShiftsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly permissionsService: PermissionsService,
+  ) {}
 
   findAll(user: AuthenticatedUser, params: { counterId?: string; status?: ShiftStatus }) {
     return this.prisma.shift.findMany({
@@ -36,7 +40,15 @@ export class ShiftsService {
   /** FR-090/BR-021: one OPEN shift per counter, enforced by a partial unique
    * index at the DB level (docs/08-database-schema.md §5) — this check is
    * the fast-path UX error; the index is the real guarantee. */
-  async open(dto: OpenShiftDto, userId: string) {
+  async open(dto: OpenShiftDto, user: AuthenticatedUser) {
+    if (user.role === "CASHIER") {
+      await this.permissionsService.assert(
+        user,
+        "canOpenCloseShift",
+        "You don't have permission to open a shift. Ask an admin.",
+      );
+    }
+    const userId = user.id;
     const existing = await this.prisma.shift.findUnique({ where: { id: dto.id } });
     if (existing) return existing; // idempotent replay
 
@@ -63,6 +75,13 @@ export class ShiftsService {
   /** FR-092: client submits only the counted actual cash; expectedCash and
    * difference are always computed server-side. */
   async close(id: string, dto: CloseShiftDto, user: AuthenticatedUser) {
+    if (user.role === "CASHIER") {
+      await this.permissionsService.assert(
+        user,
+        "canOpenCloseShift",
+        "You don't have permission to close a shift. Ask an admin.",
+      );
+    }
     const shift = await this.findOne(id, user);
     if (shift.status !== ShiftStatus.OPEN) {
       throw new DomainError(ErrorCode.VALIDATION_ERROR, "This shift is already closed.", { id });
